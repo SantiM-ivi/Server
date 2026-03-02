@@ -15,6 +15,12 @@ labels_path = tf.keras.utils.get_file(
 )
 labels = open(labels_path).read().splitlines()
 
+# Endpoint raíz para probar en navegador
+@app.route("/")
+def home():
+    return "Servidor online 🚀"
+
+# Endpoint de clasificación
 @app.route("/clasificar", methods=["POST"])
 def clasificar():
     file = request.files["imagen"]
@@ -48,3 +54,4 @@ def clasificar():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=5000)
+

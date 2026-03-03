@@ -7,6 +7,8 @@ import requests
 import os
 
 app = Flask(__name__)
+# Permitir hasta 16 MB por archivo (ajustá según necesidad)
+app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 
 # Cargar modelo una sola vez
 model = hub.load("https://tfhub.dev/google/imagenet/mobilenet_v2_100_224/classification/5")
@@ -24,38 +26,53 @@ def home():
 # Endpoint de clasificación
 @app.route("/clasificar", methods=["POST"])
 def clasificar():
+    # Log para depuración
+    print("Archivos recibidos:", request.files)
+
+    if "imagen" not in request.files:
+        return jsonify({"error": "Campo 'imagen' no encontrado"}), 400
+
     file = request.files["imagen"]
-    img = Image.open(file).resize((224, 224))
-    img = np.array(img) / 255.0
-    img = img.astype(np.float32)
-    img = np.expand_dims(img, axis=0)
+    if file.filename == "":
+        return jsonify({"error": "Archivo vacío"}), 400
 
-    predictions = model(img)
-    predicted_class = np.argmax(predictions[0])
-    etiqueta = labels[predicted_class]
+    try:
+        img = Image.open(file).resize((224, 224))
+        img = np.array(img) / 255.0
+        img = img.astype(np.float32)
+        img = np.expand_dims(img, axis=0)
 
-    # Consultar Met Museum
-    search_url = f"https://collectionapi.metmuseum.org/public/collection/v1/search?q={etiqueta}"
-    response = requests.get(search_url).json()
+        predictions = model(img)
+        predicted_class = np.argmax(predictions[0])
+        etiqueta = labels[predicted_class]
 
-    result = {"query": etiqueta}
-    if response.get("total", 0) > 0:
-        object_id = response["objectIDs"][0]
-        object_url = f"https://collectionapi.metmuseum.org/public/collection/v1/objects/{object_id}"
-        object_data = requests.get(object_url).json()
-        result.update({
-            "title": object_data.get("title", ""),
-            "artist": object_data.get("artistDisplayName", ""),
-            "date": object_data.get("objectDate", ""),
-            "department": object_data.get("department", ""),
-            "url": object_data.get("objectURL", "")
-        })
+        # Consultar Met Museum
+        search_url = f"https://collectionapi.metmuseum.org/public/collection/v1/search?q={etiqueta}"
+        response = requests.get(search_url).json()
 
-    return jsonify(result)
+        result = {"query": etiqueta}
+        if response.get("total", 0) > 0:
+            object_id = response["objectIDs"][0]
+            object_url = f"https://collectionapi.metmuseum.org/public/collection/v1/objects/{object_id}"
+            object_data = requests.get(object_url).json()
+            result.update({
+                "title": object_data.get("title", ""),
+                "artist": object_data.get("artistDisplayName", ""),
+                "date": object_data.get("objectDate", ""),
+                "department": object_data.get("department", ""),
+                "url": object_data.get("objectURL", "")
+            })
+
+        return jsonify(result)
+
+    except Exception as e:
+        print("Error procesando imagen:", e)
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
     # Render asigna el puerto en la variable de entorno PORT
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
 
 

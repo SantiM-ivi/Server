@@ -8,89 +8,86 @@ import os
 import base64
 import io
 
-# 1. DEFINIR LA APP (Esto debe ir antes de cualquier @app.route)
 app = Flask(__name__)
-
-# Permitir hasta 16 MB por petición
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 
-# 2. CARGAR EL MODELO (Se hace al iniciar el servidor)
-print("Cargando modelo de IA...")
-try:
-    model = hub.load("https://tfhub.dev/google/imagenet/mobilenet_v2_100_224/classification/5")
-    labels_path = tf.keras.utils.get_file(
-        "ImageNetLabels.txt",
-        "https://storage.googleapis.com/download.tensorflow.org/data/ImageNetLabels.txt"
-    )
-    labels = open(labels_path).read().splitlines()
-    print("Modelo y etiquetas listos.")
-except Exception as e:
-    print(f"Error cargando el modelo: {e}")
+# --- CARGA DEL MODELO ---
+print("Cargando IA...")
+model = hub.load("https://tfhub.dev/google/imagenet/mobilenet_v2_100_224/classification/5")
+labels_path = tf.keras.utils.get_file("ImageNetLabels.txt", "https://storage.googleapis.com/download.tensorflow.org/data/ImageNetLabels.txt")
+labels = open(labels_path).read().splitlines()
 
-# 3. DEFINIR LOS ENDPOINTS
-@app.route("/")
-def home():
-    return "Servidor online 🚀 - Esperando peticiones en /clasificar"
+# --- FUNCIONES DE BÚSQUEDA ---
+
+def buscar_en_wikipedia(query):
+    try:
+        # Buscamos en Wikipedia en Español
+        url = f"https://es.wikipedia.org/api/rest_v1/page/summary/{query.replace(' ', '_')}"
+        res = requests.get(url, timeout=3)
+        if res.status_code == 200:
+            data = res.json()
+            return {
+                "titulo": data.get("title"),
+                "descripcion": data.get("extract"),
+                "wiki_url": data.get("content_urls", {}).get("desktop", {}).get("page")
+            }
+    except: return None
+    return None
+
+def buscar_en_museos(query):
+    """ Intenta buscar en el Met Museum para info técnica """
+    try:
+        url_search = f"https://collectionapi.metmuseum.org/public/collection/v1/search?q={query}"
+        res_search = requests.get(url_search, timeout=3).json()
+        if res_search.get("total", 0) > 0:
+            obj_id = res_search["objectIDs"][0]
+            obj_data = requests.get(f"https://collectionapi.metmuseum.org/public/collection/v1/objects/{obj_id}", timeout=3).json()
+            return {
+                "obra": obj_data.get("title"),
+                "artista": obj_data.get("artistDisplayName"),
+                "fecha": obj_data.get("objectDate"),
+                "museo": "Metropolitan Museum of Art"
+            }
+    except: return None
+    return None
+
+# --- ENDPOINT PRINCIPAL ---
 
 @app.route("/clasificar", methods=["POST"])
 def clasificar():
-    # Obtener los datos del JSON enviado por Godot
     data = request.get_json()
-    
     if not data or "imagen" not in data:
-        return jsonify({"error": "No se recibió el campo 'imagen' en el JSON"}), 400
+        return jsonify({"error": "No hay imagen"}), 400
 
     try:
-        # Decodificar Base64
-        img_b64 = data["imagen"]
-        if "," in img_b64:
-            img_b64 = img_b64.split(",")[1]
-            
-        image_bytes = base64.b64decode(img_b64)
-        img_file = io.BytesIO(image_bytes)
-        
-        # Preprocesamiento
-        img = Image.open(img_file).convert("RGB").resize((224, 224))
-        img_array = np.array(img) / 255.0
-        img_array = img_array.astype(np.float32)
-        img_array = np.expand_dims(img_array, axis=0)
+        # 1. Procesar Imagen
+        img_b64 = data["imagen"].split(",")[1] if "," in data["imagen"] else data["imagen"]
+        img = Image.open(io.BytesIO(base64.b64decode(img_b64))).convert("RGB").resize((224, 224))
+        img_array = np.array(img).astype(np.float32)[np.newaxis, ...] / 255.0
 
-        # Predicción
+        # 2. IA Predicción
         predictions = model(img_array)
-        predicted_class = np.argmax(predictions[0])
-        etiqueta = labels[predicted_class]
+        etiqueta = labels[np.argmax(predictions[0])].split(",")[0]
         
-        print(f"IA detectó: {etiqueta}")
+        # 3. BÚSQUEDA MULTI-API (Wikipedia + Museos)
+        wiki_info = buscar_en_wikipedia(etiqueta)
+        museo_info = buscar_en_museos(etiqueta)
 
-        # Consultar Met Museum
-        search_url = f"https://collectionapi.metmuseum.org/public/collection/v1/search?q={etiqueta}"
-        search_response = requests.get(search_url).json()
+        # 4. Combinar Resultados
+        respuesta = {
+            "query": etiqueta,
+            "wikipedia": wiki_info if wiki_info else {"descripcion": "No se encontró artículo detallado."},
+            "museo": museo_info if museo_info else None
+        }
 
-        result = {"query": etiqueta}
-        
-        if search_response.get("total", 0) > 0:
-            object_id = search_response["objectIDs"][0]
-            object_url = f"https://collectionapi.metmuseum.org/public/collection/v1/objects/{object_id}"
-            object_data = requests.get(object_url).json()
-            
-            result.update({
-                "title": object_data.get("title", "Sin título"),
-                "artist": object_data.get("artistDisplayName", "Artista desconocido"),
-                "date": object_data.get("objectDate", "Fecha desconocida"),
-                "department": object_data.get("department", ""),
-                "url": object_data.get("objectURL", "")
-            })
-        
-        return jsonify(result)
+        return jsonify(respuesta)
 
     except Exception as e:
-        print(f"Error en clasificar: {e}")
+        print(f"Error: {e}")
         return jsonify({"error": str(e)}), 500
 
-# 4. EJECUCIÓN
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
+    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
 
 
 

@@ -1,55 +1,33 @@
-from flask import Flask, request, jsonify
-import tensorflow as tf
-import tensorflow_hub as hub
-import numpy as np
-import PIL.Image as Image
-import requests
-import os
+import base64
+import io
 
-app = Flask(__name__)
-# Permitir hasta 16 MB por archivo (ajustá según necesidad)
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
-
-# Cargar modelo una sola vez
-model = hub.load("https://tfhub.dev/google/imagenet/mobilenet_v2_100_224/classification/5")
-labels_path = tf.keras.utils.get_file(
-    "ImageNetLabels.txt",
-    "https://storage.googleapis.com/download.tensorflow.org/data/ImageNetLabels.txt"
-)
-labels = open(labels_path).read().splitlines()
-
-# Endpoint raíz para probar en navegador
-@app.route("/")
-def home():
-    return "Servidor online 🚀"
-
-# Endpoint de clasificación
 @app.route("/clasificar", methods=["POST"])
 def clasificar():
-    # Log para depuración
-    print("Archivos recibidos:", request.files)
-
-    if "imagen" not in request.files:
-        return jsonify({"error": "Campo 'imagen' no encontrado"}), 400
-
-    file = request.files["imagen"]
-    if file.filename == "":
-        return jsonify({"error": "Archivo vacío"}), 400
+    data = request.get_json()
+    
+    if not data or "imagen" not in data:
+        return jsonify({"error": "No se recibió el campo 'imagen' en el JSON"}), 400
 
     try:
+        # Decodificar la imagen desde Base64
+        image_data = base64.b64decode(data["imagen"])
+        file = io.BytesIO(image_data)
+        
+        # El resto del código de procesamiento sigue igual...
         img = Image.open(file).resize((224, 224))
+        # ... (tus predicciones de TensorFlow y búsqueda en el Met) ...
+        
+        # (Asegúrate de que el resto del código sea igual al que tenías)
         img = np.array(img) / 255.0
         img = img.astype(np.float32)
         img = np.expand_dims(img, axis=0)
-
         predictions = model(img)
         predicted_class = np.argmax(predictions[0])
         etiqueta = labels[predicted_class]
-
-        # Consultar Met Museum
+        
+        # Consultar Met Museum...
         search_url = f"https://collectionapi.metmuseum.org/public/collection/v1/search?q={etiqueta}"
         response = requests.get(search_url).json()
-
         result = {"query": etiqueta}
         if response.get("total", 0) > 0:
             object_id = response["objectIDs"][0]
@@ -62,17 +40,12 @@ def clasificar():
                 "department": object_data.get("department", ""),
                 "url": object_data.get("objectURL", "")
             })
-
         return jsonify(result)
 
     except Exception as e:
-        print("Error procesando imagen:", e)
+        print("Error:", e)
         return jsonify({"error": str(e)}), 500
 
-if __name__ == "__main__":
-    # Render asigna el puerto en la variable de entorno PORT
-    port = int(os.environ.get("PORT", 5000))
-    app.run(host="0.0.0.0", port=port)
 
 
 

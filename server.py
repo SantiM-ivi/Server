@@ -1,55 +1,122 @@
 from flask import Flask, request, jsonify
-import tensorflow as tf
-import tensorflow_hub as hub
-import numpy as np
-import PIL.Image as Image
 import requests
-import os
+from bs4 import BeautifulSoup
+import re
 import base64
 import io
+import os
 
 app = Flask(__name__)
+# Permitir imágenes de hasta 16MB
 app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024
 
-# --- CARGA DEL MODELO ---
-print("Cargando IA...")
-model = hub.load("https://tfhub.dev/google/imagenet/mobilenet_v2_100_224/classification/5")
-labels_path = tf.keras.utils.get_file("ImageNetLabels.txt", "https://storage.googleapis.com/download.tensorflow.org/data/ImageNetLabels.txt")
-labels = open(labels_path).read().splitlines()
+# --- CONFIGURACIÓN DE LLAVES ---
+IMGBB_API_KEY = "89210d3875e24f75585ba5e2032b4566"
+SERPAPI_KEY = "45fface95679af33c4823b73f9c49b5e0e6ef7514abfef8d162a5fb05174dae5"
+EUROPEANA_API_KEY = "rierighobje" 
 
-# --- FUNCIONES DE BÚSQUEDA ---
+# --- LÓGICA DE PROCESAMIENTO Y FILTRADO ---
 
-def buscar_en_wikipedia(query):
+def traducir_texto(texto):
+    if not texto or len(texto) < 3: return "En estudio"
     try:
-        # Buscamos en Wikipedia en Español
-        url = f"https://es.wikipedia.org/api/rest_v1/page/summary/{query.replace(' ', '_')}"
-        res = requests.get(url, timeout=3)
-        if res.status_code == 200:
-            data = res.json()
+        url = f"https://api.mymemory.translated.net/get?q={texto[:500]}&langpair=en|es"
+        res = requests.get(url, timeout=5).json()
+        return res.get('responseData', {}).get('translatedText', texto)
+    except: return texto
+
+def validar_filtro_estricto(corpus, ficha_keys):
+    corpus = corpus.lower()
+    # Bloqueo de Personas
+    biograficos = ['born', 'died', 'nacimiento', 'fallecimiento', 'biografía', 'biography', 'spouse', 'politician', 'president']
+    if any(p in str(ficha_keys).lower() for p in biograficos): return False
+
+    # Filtros Positivos (ES/EN)
+    filtros = [
+        'dinosaur', 'fossil', 'fósil', 'inca', 'aztec', 'azteca', 'maya', 'egypt', 'egipto', 
+        'roman', 'romano', 'pre-columbian', 'precolombino', 'colonial', 'stone age', 'bronze age', 
+        'iron age', 'stone', 'piedra', 'pottery', 'cerámica', 'gold', 'oro', 'silver', 'plata', 
+        'bronze', 'bronce', 'wood', 'madera', 'bone', 'hueso', 'textile', 'textil', 'vessel', 
+        'vasija', 'mask', 'máscara', 'sculpture', 'escultura', 'weapon', 'arma', 'tool', 
+        'herramienta', 'jewelry', 'joya', 'idol', 'ídolo', 'disc', 'disco', 'cretaceous', 'cretácico'
+    ]
+    exclusiones = ['toy', 'juguete', 'poster', 'fanart', 'plastic', 'plástico', 'modern replica']
+    
+    tiene_clave = any(f in corpus for f in filtros)
+    es_moderno = any(e in corpus for e in exclusiones)
+    return tiene_clave and not es_moderno
+
+def buscar_palabras_clave(texto, lista_keywords):
+    for word in lista_keywords:
+        if word.lower() in texto.lower(): return word.capitalize()
+    return "En estudio"
+
+def consulta_europeana(termino):
+    try:
+        url = "https://api.europeana.eu/record/v2/search.json"
+        params = {"wskey": EUROPEANA_API_KEY, "query": termino, "rows": 1, "profile": "rich"}
+        res = requests.get(url, params=params, timeout=5).json()
+        if res.get('items'):
+            item = res['items'][0]
             return {
-                "titulo": data.get("title"),
-                "descripcion": data.get("extract"),
-                "wiki_url": data.get("content_urls", {}).get("desktop", {}).get("page")
+                'cultura': item.get('dcCreator', ['Desconocida'])[0],
+                'epoca': item.get('year', ['En estudio'])[0],
+                'material': item.get('dcType', ['No especificado'])[0],
+                'ubicacion': item.get('dataProvider', ['Colección técnica'])[0]
             }
     except: return None
-    return None
 
-def buscar_en_museos(query):
-    """ Intenta buscar en el Met Museum para info técnica """
+def extraer_datos_profundos(url, nombre_sugerido):
+    ficha = {
+        'nombre': nombre_sugerido.upper(),
+        'cultura': 'En estudio',
+        'epoca': 'En estudio',
+        'material': 'En estudio',
+        'ubicacion': 'En estudio',
+        'dimensiones': 'En estudio',
+        'resumen': 'Sin descripción.'
+    }
     try:
-        url_search = f"https://collectionapi.metmuseum.org/public/collection/v1/search?q={query}"
-        res_search = requests.get(url_search, timeout=3).json()
-        if res_search.get("total", 0) > 0:
-            obj_id = res_search["objectIDs"][0]
-            obj_data = requests.get(f"https://collectionapi.metmuseum.org/public/collection/v1/objects/{obj_id}", timeout=3).json()
-            return {
-                "obra": obj_data.get("title"),
-                "artista": obj_data.get("artistDisplayName"),
-                "fecha": obj_data.get("objectDate"),
-                "museo": "Metropolitan Museum of Art"
-            }
-    except: return None
-    return None
+        header = {'User-Agent': 'Mozilla/5.0'}
+        res = requests.get(url, headers=header, timeout=5)
+        soup = BeautifulSoup(res.content, 'html.parser')
+        texto_completo = soup.get_text()
+        
+        infobox = soup.find('table', {'class': ['infobox', 'vcard', 'biota']})
+        if infobox:
+            for row in infobox.find_all('tr'):
+                th, td = row.find('th'), row.find('td')
+                if th and td:
+                    lbl, val = th.text.strip().lower(), re.sub(r'\[\d+\]', '', td.get_text(separator=" ").strip())
+                    if any(x in lbl for x in ['cultura', 'culture', 'civilización', 'species', 'especie']): ficha['cultura'] = val
+                    elif any(x in lbl for x in ['temporal range', 'rango temporal', 'lived', 'época', 'periodo']): ficha['epoca'] = val
+                    elif any(x in lbl for x in ['material', 'medium', 'tipo']): ficha['material'] = val
+                    elif any(x in lbl for x in ['ubicación', 'location', 'museo']): ficha['ubicacion'] = val
+                    elif any(x in lbl for x in ['dimensiones', 'dimensions', 'height', 'longitud']): ficha['dimensiones'] = val
+
+        # Respaldos por texto si la tabla falla
+        if ficha['cultura'] == "En estudio":
+            ficha['cultura'] = buscar_palabras_clave(texto_completo, ['Inca', 'Azteca', 'Maya', 'Egipto', 'Romano', 'Moche'])
+        if ficha['material'] == "En estudio":
+            ficha['material'] = buscar_palabras_clave(texto_completo, ['Oro', 'Piedra', 'Cerámica', 'Bronce', 'Plata', 'Hueso'])
+        if ficha['epoca'] == "En estudio":
+            ficha['epoca'] = buscar_palabras_clave(texto_completo, ['Cretácico', 'Jurásico', 'Siglo', 'BC', 'AD'])
+
+        # Respaldo Europeana
+        if ficha['cultura'] == "En estudio":
+            eur = consulta_europeana(nombre_sugerido)
+            if eur:
+                ficha['cultura'] = eur['cultura']
+                ficha['epoca'] = eur['epoca']
+                ficha['material'] = eur['material']
+                ficha['ubicacion'] = eur['ubicacion']
+
+        p = soup.find('p', {'class': False}) or soup.find('p')
+        if p: ficha['resumen'] = traducir_texto(p.text.strip())
+        ficha['valid_corpus'] = texto_completo
+
+    except: pass
+    return ficha
 
 # --- ENDPOINT PRINCIPAL ---
 
@@ -60,34 +127,45 @@ def clasificar():
         return jsonify({"error": "No hay imagen"}), 400
 
     try:
-        # 1. Procesar Imagen
+        # 1. Subir a ImgBB para obtener URL pública (Necesaria para Google Lens)
         img_b64 = data["imagen"].split(",")[1] if "," in data["imagen"] else data["imagen"]
-        img = Image.open(io.BytesIO(base64.b64decode(img_b64))).convert("RGB").resize((224, 224))
-        img_array = np.array(img).astype(np.float32)[np.newaxis, ...] / 255.0
+        res_imgbb = requests.post(
+            "https://api.imgbb.com/1/upload", 
+            {"key": IMGBB_API_KEY}, 
+            files={"image": ("image.jpg", base64.b64decode(img_b64))}
+        ).json()
+        image_url = res_imgbb["data"]["url"]
 
-        # 2. IA Predicción
-        predictions = model(img_array)
-        etiqueta = labels[np.argmax(predictions[0])].split(",")[0]
-        
-        # 3. BÚSQUEDA MULTI-API (Wikipedia + Museos)
-        wiki_info = buscar_en_wikipedia(etiqueta)
-        museo_info = buscar_en_museos(etiqueta)
+        # 2. Google Lens Identificación
+        lens_params = {"engine": "google_lens", "url": image_url, "api_key": SERPAPI_KEY, "hl": "es"}
+        lens_data = requests.get("https://serpapi.com/search", params=lens_params).json()
+        matches = lens_data.get("visual_matches", [])
 
-        # 4. Combinar Resultados
-        respuesta = {
-            "query": etiqueta,
-            "wikipedia": wiki_info if wiki_info else {"descripcion": "No se encontró artículo detallado."},
-            "museo": museo_info if museo_info else None
-        }
+        # 3. Filtrado y Extracción
+        ficha_final = None
+        for m in matches[:10]:
+            if "wikipedia.org" in m.get("link", ""):
+                url_test = m["link"]
+                nombre_test = lens_data.get("knowledge_graph", [{}])[0].get("title", m.get("title", "Objeto"))
+                ficha_test = extraer_datos_profundos(url_test, nombre_test)
+                
+                if validar_filtro_estricto(ficha_test.get('valid_corpus', ''), ficha_test.keys()):
+                    ficha_final = ficha_test
+                    break
 
-        return jsonify(respuesta)
+        if ficha_final:
+            # Eliminamos el corpus de validación antes de enviar a Godot para limpiar la respuesta
+            ficha_final.pop('valid_corpus', None)
+            return jsonify(ficha_final)
+        else:
+            return jsonify({"error": "No se detectó una pieza arqueológica válida bajo los filtros establecidos."}), 404
 
     except Exception as e:
-        print(f"Error: {e}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+
 
 
 

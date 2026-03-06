@@ -4,7 +4,6 @@ tensorflow-hub
 numpy
 pillow
 requests
-Flask
-requests
 beautifulsoup4
+
 

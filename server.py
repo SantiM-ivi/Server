@@ -15,6 +15,13 @@ IMGBB_API_KEY = "89210d3875e24f75585ba5e2032b4566"
 SERPAPI_KEY = "45fface95679af33c4823b73f9c49b5e0e6ef7514abfef8d162a5fb05174dae5"
 EUROPEANA_API_KEY = "rierighobje" 
 
+# --- RUTA PARA MANTENER EL SERVER DESPIERTO (UPTIMEROBOT) ---
+
+@app.route('/')
+def home():
+    # Esta ruta responde con 200 OK para que el monitor no marque error
+    return "Servidor Activo 24/7 🚀", 200
+
 # --- LÓGICA DE PROCESAMIENTO Y FILTRADO ---
 
 def traducir_texto(texto):
@@ -127,7 +134,7 @@ def clasificar():
         return jsonify({"error": "No hay imagen"}), 400
 
     try:
-        # 1. Subir a ImgBB para obtener URL pública (Necesaria para Google Lens)
+        # 1. Subir a ImgBB para obtener URL pública
         img_b64 = data["imagen"].split(",")[1] if "," in data["imagen"] else data["imagen"]
         res_imgbb = requests.post(
             "https://api.imgbb.com/1/upload", 
@@ -154,7 +161,6 @@ def clasificar():
                     break
 
         if ficha_final:
-            # Eliminamos el corpus de validación antes de enviar a Godot para limpiar la respuesta
             ficha_final.pop('valid_corpus', None)
             return jsonify(ficha_final)
         else:

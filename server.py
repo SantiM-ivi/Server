@@ -6,7 +6,7 @@ import os
 import base64
 import io
 from PIL import Image
-import imagehash  # Recordá poner ImageHash en requirements.txt
+import imagehash 
 from datetime import datetime
 
 app = Flask(__name__)
@@ -19,8 +19,6 @@ DATABASE_NAME = 'museo.db'
 
 if not os.path.exists(UPLOAD_PARENT_DIR):
     os.makedirs(UPLOAD_PARENT_DIR)
-
-# --- SISTEMA DE BASE DE DATOS (AUTO-CREACIÓN) ---
 
 def get_db_connection():
     conn = sqlite3.connect(DATABASE_NAME)
@@ -49,23 +47,19 @@ def init_db():
 
 init_db()
 
-# --- FUNCIONES DE APOYO ---
-
 def calcular_hash(imagen_bytes):
-    """ Convierte una imagen en una huella digital matemática """
     try:
         img = Image.open(io.BytesIO(imagen_bytes))
+        # Convertimos a escala de grises y redimensionamos para que la comparación sea más estable
         return str(imagehash.phash(img))
     except:
         return None
-
-# --- RUTA PARA MANTENER EL SERVER DESPIERTO ---
 
 @app.route('/')
 def home():
     return "Servidor Activo 24/7 🚀", 200
 
-# --- ENDPOINTS PARA EL PANEL WEB ---
+# --- ENDPOINTS PANEL WEB ---
 
 @app.route("/web/subir_completo", methods=["POST"])
 def subir_pieza_museo():
@@ -76,15 +70,14 @@ def subir_pieza_museo():
         carpeta_pieza = os.path.join(UPLOAD_PARENT_DIR, meta['nombre'].replace(" ", "_"))
         os.makedirs(carpeta_pieza, exist_ok=True)
         
-        hash_referencia = ""
+        # Calculamos el hash de la PRIMERA foto cargada (la frontal)
+        primer_foto = fotos[0].read()
+        hash_ref = calcular_hash(primer_foto)
+        
+        # Guardar todas las fotos físicamente
+        fotos[0].seek(0) # Resetear puntero para guardar
         for i, foto in enumerate(fotos):
-            contenido = foto.read()
-            # Guardamos el hash de la primera foto como patrón
-            if i == 0:
-                hash_referencia = calcular_hash(contenido)
-            
-            with open(os.path.join(carpeta_pieza, f"angulo_{i+1}.jpg"), "wb") as f:
-                f.write(contenido)
+            foto.save(os.path.join(carpeta_pieza, f"angulo_{i+1}.jpg"))
             
         conn = get_db_connection()
         cursor = conn.cursor()
@@ -93,9 +86,10 @@ def subir_pieza_museo():
             (museo_id, nombre, cultura, epoca, material, ubicacion, resumen, hash_visual, carpeta_fotos)
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (meta['museo'], meta['nombre'], meta['cultura'], meta['epoca'], 
-              meta['material'], meta['ubicacion'], meta['resumen'], hash_referencia, carpeta_pieza))
+              meta['material'], meta['ubicacion'], meta['resumen'], hash_ref, carpeta_pieza))
         conn.commit()
         conn.close()
+        print(f"✅ REGISTRADO: {meta['nombre']} con hash {hash_ref}")
         return jsonify({"status": "success"}), 201
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -118,25 +112,7 @@ def obtener_pieza(id):
     conn.close()
     return jsonify(dict(pieza)) if pieza else ({}, 404)
 
-@app.route("/web/editar/<int:id>", methods=["POST"])
-def editar_pieza(id):
-    try:
-        meta = json.loads(request.form.get('metadata'))
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-            UPDATE piezas SET 
-            museo_id=?, nombre=?, cultura=?, epoca=?, material=?, ubicacion=?, resumen=?
-            WHERE id=?
-        ''', (meta['museo'], meta['nombre'], meta['cultura'], meta['epoca'], 
-              meta['material'], meta['ubicacion'], meta['resumen'], id))
-        conn.commit()
-        conn.close()
-        return jsonify({"status": "success"}), 200
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-# --- ENDPOINT DE CLASIFICACIÓN (APP GODOT) ---
+# --- ENDPOINT DE CLASIFICACIÓN (EL QUE DA 404) ---
 
 @app.route("/clasificar", methods=["POST"])
 def clasificar():
@@ -145,12 +121,10 @@ def clasificar():
         return jsonify({"error": "No hay imagen"}), 400
 
     try:
-        # 1. Decodificar imagen de la App
         img_b64 = data["imagen"].split(",")[1] if "," in data["imagen"] else data["imagen"]
         img_bytes = base64.b64decode(img_b64)
         hash_app = imagehash.phash(Image.open(io.BytesIO(img_bytes)))
         
-        # 2. Comparar visualmente con la Base de Datos
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM piezas")
@@ -158,18 +132,24 @@ def clasificar():
         conn.close()
 
         mejor_match = None
-        umbral_similitud = 14 # Si la diferencia es menor a 14, se considera la misma pieza
+        # SUBIMOS EL UMBRAL: Antes era 14, ahora 24 para que sea MUCHO más fácil que coincida
+        menor_distancia = 24 
+
+        print(f"DEBUG: Hash de la App: {hash_app}")
 
         for pieza in piezas_db:
             if pieza['hash_visual']:
                 hash_db = imagehash.hex_to_hash(pieza['hash_visual'])
                 distancia = hash_app - hash_db
                 
-                if distancia < umbral_similitud:
-                    umbral_similitud = distancia
+                print(f"DEBUG: Comparando con {pieza['nombre']} - Distancia: {distancia}")
+                
+                if distancia < menor_distancia:
+                    menor_distancia = distancia
                     mejor_match = pieza
 
         if mejor_match:
+            print(f"🎯 MATCH EXITOSO: {mejor_match['nombre']} (Distancia: {menor_distancia})")
             return jsonify({
                 "nombre": mejor_match['nombre'],
                 "cultura": mejor_match['cultura'],
@@ -179,14 +159,15 @@ def clasificar():
                 "resumen": mejor_match['resumen']
             })
 
-        return jsonify({"error": "Pieza no reconocida en la base de datos"}), 404
+        print("❌ ERROR: No hubo coincidencia cercana en la base de datos.")
+        return jsonify({"error": "No reconocida"}), 404
 
     except Exception as e:
+        print(f"⚠️ ERROR: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-
 
 
 

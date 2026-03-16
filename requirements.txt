@@ -6,4 +6,4 @@ pandas
 numpy
 Pillow
 gunicorn
-openpyxl
+ImageHash

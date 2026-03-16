@@ -51,7 +51,7 @@ def init_db():
 
 init_db()
 
-# --- LÓGICA DE PROCESAMIENTO ---
+# --- FUNCIONES DE APOYO ---
 
 def traducir_texto(texto):
     if not texto or len(texto) < 3: return "En estudio"
@@ -62,10 +62,6 @@ def traducir_texto(texto):
     except: return texto
 
 def es_humano_real(texto_analizar):
-    """
-    Único filtro activo: Bloquea si la descripción contiene palabras 
-    relacionadas con personas reales.
-    """
     bloqueo = ['person', 'human', 'man', 'woman', 'selfie', 'persona', 'hombre', 'mujer', 'boy', 'girl', 'face', 'rostro']
     texto_analizar = texto_analizar.lower()
     return any(p in texto_analizar for p in bloqueo)
@@ -73,10 +69,10 @@ def es_humano_real(texto_analizar):
 def extraer_datos_wikipedia(url, nombre_sugerido):
     ficha = {
         'nombre': nombre_sugerido.upper(),
-        'cultura': 'Información general',
-        'epoca': 'No especificada',
+        'cultura': 'Información General (Wiki)',
+        'epoca': 'Ver descripción',
         'material': 'Varios',
-        'ubicacion': 'Ver descripción',
+        'ubicacion': 'Búsqueda Online',
         'resumen': 'Sin descripción disponible.'
     }
     try:
@@ -84,15 +80,11 @@ def extraer_datos_wikipedia(url, nombre_sugerido):
         res = requests.get(url, headers=header, timeout=5)
         soup = BeautifulSoup(res.content, 'html.parser')
         
-        # Filtro de seguridad humano
-        if es_humano_real(soup.get_text()):
-            return None
+        if es_humano_real(soup.get_text()): return None
 
-        # Intentar sacar resumen del primer párrafo
         p = soup.find('p', {'class': False}) or soup.find('p')
         if p: ficha['resumen'] = traducir_texto(p.text.strip())
         
-        # Intentar extraer datos de la tabla (infobox)
         infobox = soup.find('table', {'class': ['infobox']})
         if infobox:
             for row in infobox.find_all('tr'):
@@ -100,13 +92,12 @@ def extraer_datos_wikipedia(url, nombre_sugerido):
                 if th and td:
                     lbl, val = th.text.strip().lower(), td.text.strip()
                     if any(x in lbl for x in ['cultura', 'culture', 'civilización']): ficha['cultura'] = val
-                    elif any(x in lbl for x in ['época', 'period', 'año']): ficha['epoca'] = val
+                    elif any(x in lbl for x in ['época', 'period', 'año', 'lived']): ficha['epoca'] = val
                     elif any(x in lbl for x in ['material', 'medium']): ficha['material'] = val
-                    elif any(x in lbl for x in ['ubicación', 'location', 'museo']): ficha['ubicacion'] = val
     except: pass
     return ficha
 
-# --- ENDPOINTS WEB ---
+# --- ENDPOINTS PANEL WEB ---
 
 @app.route("/web/subir_completo", methods=["POST"])
 def subir_pieza_museo():
@@ -127,7 +118,7 @@ def subir_pieza_museo():
         conn.commit()
         conn.close()
         return jsonify({"status": "success"}), 201
-    except Exception as e: return jsonify({"status": "error", "message": str(e)}), 500
+    except Exception as e: return jsonify({"error": str(e)}), 500
 
 @app.route("/web/lista", methods=["GET"])
 def listar_piezas():
@@ -138,16 +129,41 @@ def listar_piezas():
     conn.close()
     return jsonify(piezas)
 
+@app.route("/web/obtener/<int:id>", methods=["GET"])
+def obtener_pieza(id):
+    conn = get_db_connection()
+    cursor = conn.cursor()
+    cursor.execute("SELECT * FROM piezas WHERE id = ?", (id,))
+    pieza = cursor.fetchone()
+    conn.close()
+    return jsonify(dict(pieza)) if pieza else ({}, 404)
+
+@app.route("/web/editar/<int:id>", methods=["POST"])
+def editar_pieza(id):
+    try:
+        meta = json.loads(request.form.get('metadata'))
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('''
+            UPDATE piezas SET 
+            museo_id=?, nombre=?, cultura=?, epoca=?, material=?, ubicacion=?, resumen=?
+            WHERE id=?
+        ''', (meta['museo'], meta['nombre'], meta['cultura'], meta['epoca'], 
+              meta['material'], meta['ubicacion'], meta['resumen'], id))
+        conn.commit()
+        conn.close()
+        return jsonify({"status": "success"}), 200
+    except Exception as e: return jsonify({"error": str(e)}), 500
+
 # --- ENDPOINT CLASIFICAR (GODOT) ---
 
 @app.route("/clasificar", methods=["POST"])
 def clasificar():
     data = request.get_json()
-    if not data or "imagen" not in data:
-        return jsonify({"error": "No hay imagen"}), 400
+    if not data or "imagen" not in data: return jsonify({"error": "No hay imagen"}), 400
 
     try:
-        # 1. Subir y buscar en Google Lens
+        # 1. Obtener nombre via Google Lens
         img_b64 = data["imagen"].split(",")[1] if "," in data["imagen"] else data["imagen"]
         res_imgbb = requests.post("https://api.imgbb.com/1/upload", {"key": IMGBB_API_KEY}, 
                                   files={"image": ("image.jpg", base64.b64decode(img_b64))}).json()
@@ -162,7 +178,7 @@ def clasificar():
         elif lens_data.get("visual_matches"):
             nombre_detectado = lens_data["visual_matches"][0].get("title", "")
 
-        # 2. BUSCAR EN BD LOCAL (Lo que subieron los museos)
+        # 2. PRIORIDAD 1: Buscar en BD Local (Museo)
         if nombre_detectado:
             conn = get_db_connection()
             cursor = conn.cursor()
@@ -170,34 +186,28 @@ def clasificar():
             pieza_local = cursor.fetchone()
             conn.close()
             if pieza_local:
-                return jsonify(dict(pieza_local))
+                return jsonify({
+                    "nombre": pieza_local['nombre'], "cultura": pieza_local['cultura'],
+                    "epoca": pieza_local['epoca'], "material": pieza_local['material'],
+                    "ubicacion": pieza_local['ubicacion'], "resumen": pieza_local['resumen']
+                })
 
-        # 3. SI NO ESTÁ EN BD, BUSCAR EN WIKIPEDIA (Sin filtros de tipo de objeto)
+        # 3. PRIORIDAD 2: Buscar en Wikipedia (Respaldo)
         for m in lens_data.get("visual_matches", [])[:8]:
             if "wikipedia.org" in m.get("link", ""):
                 ficha = extraer_datos_wikipedia(m["link"], nombre_detectado or m["title"])
-                if ficha: # Si no es un humano, devolver
-                    return jsonify(ficha)
+                if ficha: return jsonify(ficha)
 
-        # 4. ÚLTIMO RECURSO: Devolver lo que diga Google Lens directamente
+        # 4. PRIORIDAD 3: Datos crudos de Google si nada más funciona
         if nombre_detectado:
             return jsonify({
-                "nombre": nombre_detectado.upper(),
-                "cultura": "General",
-                "epoca": "Desconocida",
-                "material": "No especificado",
-                "ubicacion": "Búsqueda web",
-                "resumen": "Se detectó el objeto pero no hay ficha técnica detallada."
+                "nombre": nombre_detectado.upper(), "cultura": "Información General",
+                "epoca": "En estudio", "material": "No especificado",
+                "ubicacion": "Búsqueda Web", "resumen": "Se detectó la pieza pero no hay ficha oficial."
             })
 
-        return jsonify({"error": "No se pudo identificar el objeto"}), 404
-
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-@app.route('/')
-def home():
-    return "Servidor Híbrido Activo 🚀", 200
+        return jsonify({"error": "No se pudo identificar"}), 404
+    except Exception as e: return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

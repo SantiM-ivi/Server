@@ -20,6 +20,8 @@ DATABASE_NAME = 'museo.db'
 if not os.path.exists(UPLOAD_PARENT_DIR):
     os.makedirs(UPLOAD_PARENT_DIR)
 
+# --- SISTEMA DE BASE DE DATOS ---
+
 def get_db_connection():
     conn = sqlite3.connect(DATABASE_NAME)
     conn.row_factory = sqlite3.Row
@@ -45,18 +47,25 @@ def init_db():
     conn.commit()
     conn.close()
 
+# Inicializar DB al arrancar
 init_db()
 
-def calcular_hash(imagen_bytes):
+# --- MEJORA EN EL CÁLCULO DEL HASH (MÁS TOLERANTE) ---
+def preparar_y_hash(imagen_bytes):
     try:
-        img = Image.open(io.BytesIO(imagen_bytes))
-        # Convertimos a escala de grises y redimensionamos para que la comparación sea más estable
-        return str(imagehash.phash(img))
-    except:
+        # Convertir a escala de grises y redimensionar para que luz/color no afecten tanto
+        img = Image.open(io.BytesIO(imagen_bytes)).convert('L')
+        img = img.resize((256, 256), Image.Resampling.LANCZOS)
+        return imagehash.phash(img)
+    except Exception as e:
+        print(f"Error procesando imagen: {e}")
         return None
+
+# --- RUTA PARA MANTENER EL SERVER DESPIERTO (OBLIGATORIA) ---
 
 @app.route('/')
 def home():
+    # No tocar esta ruta para que UptimeRobot funcione
     return "Servidor Activo 24/7 🚀", 200
 
 # --- ENDPOINTS PANEL WEB ---
@@ -70,12 +79,12 @@ def subir_pieza_museo():
         carpeta_pieza = os.path.join(UPLOAD_PARENT_DIR, meta['nombre'].replace(" ", "_"))
         os.makedirs(carpeta_pieza, exist_ok=True)
         
-        # Calculamos el hash de la PRIMERA foto cargada (la frontal)
-        primer_foto = fotos[0].read()
-        hash_ref = calcular_hash(primer_foto)
+        # Generar hash de referencia usando la primera foto (frontal)
+        primer_foto_data = fotos[0].read()
+        hash_ref = str(preparar_y_hash(primer_foto_data))
         
-        # Guardar todas las fotos físicamente
-        fotos[0].seek(0) # Resetear puntero para guardar
+        # Guardar físicamente las 5 fotos
+        fotos[0].seek(0)
         for i, foto in enumerate(fotos):
             foto.save(os.path.join(carpeta_pieza, f"angulo_{i+1}.jpg"))
             
@@ -89,7 +98,8 @@ def subir_pieza_museo():
               meta['material'], meta['ubicacion'], meta['resumen'], hash_ref, carpeta_pieza))
         conn.commit()
         conn.close()
-        print(f"✅ REGISTRADO: {meta['nombre']} con hash {hash_ref}")
+        
+        print(f"✅ REGISTRADO: {meta['nombre']} | Hash: {hash_ref}")
         return jsonify({"status": "success"}), 201
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -112,7 +122,7 @@ def obtener_pieza(id):
     conn.close()
     return jsonify(dict(pieza)) if pieza else ({}, 404)
 
-# --- ENDPOINT DE CLASIFICACIÓN (EL QUE DA 404) ---
+# --- ENDPOINT CLASIFICAR (GODOT) ---
 
 @app.route("/clasificar", methods=["POST"])
 def clasificar():
@@ -121,35 +131,41 @@ def clasificar():
         return jsonify({"error": "No hay imagen"}), 400
 
     try:
+        # Decodificar imagen de la App
         img_b64 = data["imagen"].split(",")[1] if "," in data["imagen"] else data["imagen"]
         img_bytes = base64.b64decode(img_b64)
-        hash_app = imagehash.phash(Image.open(io.BytesIO(img_bytes)))
+        hash_app = preparar_y_hash(img_bytes)
         
+        if hash_app is None:
+            return jsonify({"error": "Error al procesar imagen de la App"}), 400
+
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute("SELECT * FROM piezas")
         piezas_db = cursor.fetchall()
         conn.close()
 
-        mejor_match = None
-        # SUBIMOS EL UMBRAL: Antes era 14, ahora 24 para que sea MUCHO más fácil que coincida
-        menor_distancia = 24 
+        if not piezas_db:
+            print("⚠️ DB VACÍA")
+            return jsonify({"error": "No hay datos cargados"}), 404
 
-        print(f"DEBUG: Hash de la App: {hash_app}")
+        mejor_match = None
+        menor_distancia = 64
+        umbral_sensibilidad = 28 # Más alto = más fácil reconocer (máximo 64)
 
         for pieza in piezas_db:
             if pieza['hash_visual']:
                 hash_db = imagehash.hex_to_hash(pieza['hash_visual'])
                 distancia = hash_app - hash_db
                 
-                print(f"DEBUG: Comparando con {pieza['nombre']} - Distancia: {distancia}")
+                print(f"Comparando con {pieza['nombre']} | Distancia: {distancia}")
                 
                 if distancia < menor_distancia:
                     menor_distancia = distancia
                     mejor_match = pieza
 
-        if mejor_match:
-            print(f"🎯 MATCH EXITOSO: {mejor_match['nombre']} (Distancia: {menor_distancia})")
+        if mejor_match and menor_distancia <= umbral_sensibilidad:
+            print(f"🎯 MATCH: {mejor_match['nombre']} (D: {menor_distancia})")
             return jsonify({
                 "nombre": mejor_match['nombre'],
                 "cultura": mejor_match['cultura'],
@@ -159,7 +175,7 @@ def clasificar():
                 "resumen": mejor_match['resumen']
             })
 
-        print("❌ ERROR: No hubo coincidencia cercana en la base de datos.")
+        print(f"❌ FALLO: Distancia mínima fue {menor_distancia}")
         return jsonify({"error": "No reconocida"}), 404
 
     except Exception as e:
@@ -168,7 +184,6 @@ def clasificar():
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-
 
 
 

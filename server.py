@@ -1,27 +1,22 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import requests
-from bs4 import BeautifulSoup
-import re
-import base64
-import os
 import sqlite3
 import json
+import os
+import base64
+import io
+from PIL import Image
+import imagehash  # Librería para comparar imágenes visualmente
 from datetime import datetime
 
 app = Flask(__name__)
 CORS(app)
 
 # --- CONFIGURACIÓN ---
-app.config['MAX_CONTENT_LENGTH'] = 32 * 1024 * 1024
-UPLOAD_PARENT_DIR = 'biblioteca_museos'
 DATABASE_NAME = 'museo.db'
-
+UPLOAD_PARENT_DIR = 'biblioteca_museos'
 if not os.path.exists(UPLOAD_PARENT_DIR):
     os.makedirs(UPLOAD_PARENT_DIR)
-
-IMGBB_API_KEY = "89210d3875e24f75585ba5e2032b4566"
-SERPAPI_KEY = "45fface95679af33c4823b73f9c49b5e0e6ef7514abfef8d162a5fb05174dae5"
 
 # --- BASE DE DATOS ---
 
@@ -33,6 +28,7 @@ def get_db_connection():
 def init_db():
     conn = get_db_connection()
     cursor = conn.cursor()
+    # Agregamos 'hash_visual' para guardar la huella digital de la imagen
     cursor.execute('''
         CREATE TABLE IF NOT EXISTS piezas (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -43,6 +39,7 @@ def init_db():
             material TEXT,
             ubicacion TEXT,
             resumen TEXT,
+            hash_visual TEXT, 
             carpeta_fotos TEXT
         )
     ''')
@@ -51,74 +48,56 @@ def init_db():
 
 init_db()
 
-# --- FUNCIONES DE APOYO ---
+# --- FUNCIONES DE IA (HASHING VISUAL) ---
 
-def traducir_texto(texto):
-    if not texto or len(texto) < 3: return "En estudio"
-    try:
-        url = f"https://api.mymemory.translated.net/get?q={texto[:500]}&langpair=en|es"
-        res = requests.get(url, timeout=5).json()
-        return res.get('responseData', {}).get('translatedText', texto)
-    except: return texto
+def calcular_hash(imagen_bytes):
+    """ Convierte una imagen en una huella digital matemática """
+    img = Image.open(io.BytesIO(imagen_bytes))
+    # Usamos phash (Perceptual Hash) que es resistente a cambios de tamaño o luz
+    return str(imagehash.phash(img))
 
-def es_humano_real(texto_analizar):
-    bloqueo = ['person', 'human', 'man', 'woman', 'selfie', 'persona', 'hombre', 'mujer', 'boy', 'girl', 'face', 'rostro']
-    texto_analizar = texto_analizar.lower()
-    return any(p in texto_analizar for p in bloqueo)
-
-def extraer_datos_wikipedia(url, nombre_sugerido):
-    ficha = {
-        'nombre': nombre_sugerido.upper(),
-        'cultura': 'Información General (Wiki)',
-        'epoca': 'Ver descripción',
-        'material': 'Varios',
-        'ubicacion': 'Búsqueda Online',
-        'resumen': 'Sin descripción disponible.'
-    }
-    try:
-        header = {'User-Agent': 'Mozilla/5.0'}
-        res = requests.get(url, headers=header, timeout=5)
-        soup = BeautifulSoup(res.content, 'html.parser')
-        
-        if es_humano_real(soup.get_text()): return None
-
-        p = soup.find('p', {'class': False}) or soup.find('p')
-        if p: ficha['resumen'] = traducir_texto(p.text.strip())
-        
-        infobox = soup.find('table', {'class': ['infobox']})
-        if infobox:
-            for row in infobox.find_all('tr'):
-                th, td = row.find('th'), row.find('td')
-                if th and td:
-                    lbl, val = th.text.strip().lower(), td.text.strip()
-                    if any(x in lbl for x in ['cultura', 'culture', 'civilización']): ficha['cultura'] = val
-                    elif any(x in lbl for x in ['época', 'period', 'año', 'lived']): ficha['epoca'] = val
-                    elif any(x in lbl for x in ['material', 'medium']): ficha['material'] = val
-    except: pass
-    return ficha
-
-# --- ENDPOINTS PANEL WEB ---
+# --- ENDPOINTS PARA EL PANEL WEB ---
 
 @app.route("/web/subir_completo", methods=["POST"])
 def subir_pieza_museo():
     try:
         meta = json.loads(request.form.get('metadata'))
         fotos = request.files.getlist('fotos')
+        
+        if len(fotos) < 5:
+            return jsonify({"error": "Se requieren 5 fotos"}), 400
+
+        # Guardar archivos físicamente
         carpeta_pieza = os.path.join(UPLOAD_PARENT_DIR, meta['nombre'].replace(" ", "_"))
         os.makedirs(carpeta_pieza, exist_ok=True)
+        
+        hashes = []
         for i, foto in enumerate(fotos):
-            foto.save(os.path.join(carpeta_pieza, f"angulo_{i+1}.jpg"))
+            contenido = foto.read()
+            # Guardar foto
+            with open(os.path.join(carpeta_pieza, f"angulo_{i+1}.jpg"), "wb") as f:
+                f.write(contenido)
+            # Calcular hash de cada foto subida
+            hashes.append(calcular_hash(contenido))
+            
+        # Guardamos el primer hash como referencia principal (o podrías promediarlos)
+        hash_principal = hashes[0]
+
         conn = get_db_connection()
         cursor = conn.cursor()
         cursor.execute('''
-            INSERT OR REPLACE INTO piezas (museo_id, nombre, cultura, epoca, material, ubicacion, resumen, carpeta_fotos)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            INSERT OR REPLACE INTO piezas 
+            (museo_id, nombre, cultura, epoca, material, ubicacion, resumen, hash_visual, carpeta_fotos)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         ''', (meta['museo'], meta['nombre'], meta['cultura'], meta['epoca'], 
-              meta['material'], meta['ubicacion'], meta['resumen'], carpeta_pieza))
+              meta['material'], meta['ubicacion'], meta['resumen'], hash_principal, carpeta_pieza))
         conn.commit()
         conn.close()
+        
+        print(f"✅ Pieza {meta['nombre']} guardada con hash: {hash_principal}")
         return jsonify({"status": "success"}), 201
-    except Exception as e: return jsonify({"error": str(e)}), 500
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/web/lista", methods=["GET"])
 def listar_piezas():
@@ -129,89 +108,60 @@ def listar_piezas():
     conn.close()
     return jsonify(piezas)
 
-@app.route("/web/obtener/<int:id>", methods=["GET"])
-def obtener_pieza(id):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM piezas WHERE id = ?", (id,))
-    pieza = cursor.fetchone()
-    conn.close()
-    return jsonify(dict(pieza)) if pieza else ({}, 404)
-
-@app.route("/web/editar/<int:id>", methods=["POST"])
-def editar_pieza(id):
-    try:
-        meta = json.loads(request.form.get('metadata'))
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-            UPDATE piezas SET 
-            museo_id=?, nombre=?, cultura=?, epoca=?, material=?, ubicacion=?, resumen=?
-            WHERE id=?
-        ''', (meta['museo'], meta['nombre'], meta['cultura'], meta['epoca'], 
-              meta['material'], meta['ubicacion'], meta['resumen'], id))
-        conn.commit()
-        conn.close()
-        return jsonify({"status": "success"}), 200
-    except Exception as e: return jsonify({"error": str(e)}), 500
-
-# --- ENDPOINT CLASIFICAR (GODOT) ---
+# --- ENDPOINT DE CLASIFICACIÓN (APP GODOT) ---
 
 @app.route("/clasificar", methods=["POST"])
 def clasificar():
     data = request.get_json()
-    if not data or "imagen" not in data: return jsonify({"error": "No hay imagen"}), 400
+    if not data or "imagen" not in data:
+        return jsonify({"error": "No hay imagen"}), 400
 
     try:
-        # 1. Obtener nombre via Google Lens
+        # 1. Decodificar la imagen que manda la App
         img_b64 = data["imagen"].split(",")[1] if "," in data["imagen"] else data["imagen"]
-        res_imgbb = requests.post("https://api.imgbb.com/1/upload", {"key": IMGBB_API_KEY}, 
-                                  files={"image": ("image.jpg", base64.b64decode(img_b64))}).json()
-        image_url = res_imgbb["data"]["url"]
-
-        lens_params = {"engine": "google_lens", "url": image_url, "api_key": SERPAPI_KEY, "hl": "es"}
-        lens_data = requests.get("https://serpapi.com/search", params=lens_params).json()
+        img_bytes = base64.b64decode(img_b64)
         
-        nombre_detectado = ""
-        if lens_data.get("knowledge_graph"):
-            nombre_detectado = lens_data["knowledge_graph"][0].get("title", "")
-        elif lens_data.get("visual_matches"):
-            nombre_detectado = lens_data["visual_matches"][0].get("title", "")
+        # 2. Calcular el hash de la foto actual
+        hash_actual = imagehash.phash(Image.open(io.BytesIO(img_bytes)))
+        
+        # 3. Comparar con TODA la base de datos
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT * FROM piezas")
+        todas = cursor.fetchall()
+        conn.close()
 
-        # 2. PRIORIDAD 1: Buscar en BD Local (Museo)
-        if nombre_detectado:
-            conn = get_db_connection()
-            cursor = conn.cursor()
-            cursor.execute("SELECT * FROM piezas WHERE nombre LIKE ?", (f'%{nombre_detectado}%',))
-            pieza_local = cursor.fetchone()
-            conn.close()
-            if pieza_local:
-                return jsonify({
-                    "nombre": pieza_local['nombre'], "cultura": pieza_local['cultura'],
-                    "epoca": pieza_local['epoca'], "material": pieza_local['material'],
-                    "ubicacion": pieza_local['ubicacion'], "resumen": pieza_local['resumen']
-                })
+        mejor_match = None
+        menor_distancia = 15 # Umbral de diferencia (0 es idéntico, >20 es muy diferente)
 
-        # 3. PRIORIDAD 2: Buscar en Wikipedia (Respaldo)
-        for m in lens_data.get("visual_matches", [])[:8]:
-            if "wikipedia.org" in m.get("link", ""):
-                ficha = extraer_datos_wikipedia(m["link"], nombre_detectado or m["title"])
-                if ficha: return jsonify(ficha)
+        for pieza in todas:
+            if pieza['hash_visual']:
+                hash_db = imagehash.hex_to_hash(pieza['hash_visual'])
+                # Restar hashes da la "distancia". Si es pequeña, son la misma imagen.
+                distancia = hash_actual - hash_db
+                
+                if distancia < menor_distancia:
+                    menor_distancia = distancia
+                    mejor_match = pieza
 
-        # 4. PRIORIDAD 3: Datos crudos de Google si nada más funciona
-        if nombre_detectado:
+        if mejor_match:
+            print(f"🎯 Match encontrado: {mejor_match['nombre']} (Distancia: {menor_distancia})")
             return jsonify({
-                "nombre": nombre_detectado.upper(), "cultura": "Información General",
-                "epoca": "En estudio", "material": "No especificado",
-                "ubicacion": "Búsqueda Web", "resumen": "Se detectó la pieza pero no hay ficha oficial."
+                "nombre": mejor_match['nombre'],
+                "cultura": mejor_match['cultura'],
+                "epoca": mejor_match['epoca'],
+                "material": mejor_match['material'],
+                "ubicacion": mejor_match['ubicacion'],
+                "resumen": mejor_match['resumen']
             })
 
-        return jsonify({"error": "No se pudo identificar"}), 404
-    except Exception as e: return jsonify({"error": str(e)}), 500
+        return jsonify({"error": "No se reconoció la pieza en la base de datos visual"}), 404
+
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
-
 
 
 

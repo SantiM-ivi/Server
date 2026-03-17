@@ -7,3 +7,5 @@ numpy
 Pillow
 gunicorn
 ImageHash
+psycopg2-binary
+SQLAlchemy

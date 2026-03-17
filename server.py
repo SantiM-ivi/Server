@@ -1,72 +1,68 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import sqlite3
-import json
-import os
+import requests
+from bs4 import BeautifulSoup
+import re
 import base64
+import os
+import json
 import io
 from PIL import Image
-import imagehash 
+import imagehash
+from sqlalchemy import create_engine, text
 from datetime import datetime
 
 app = Flask(__name__)
 CORS(app)
 
-# --- CONFIGURACIÓN ---
-app.config['MAX_CONTENT_LENGTH'] = 32 * 1024 * 1024 
-UPLOAD_PARENT_DIR = 'biblioteca_museos'
-DATABASE_NAME = 'museo.db'
+# --- CONFIGURACIÓN DE BASE DE DATOS (SUPABASE) ---
+# Reemplaza 'TU_CONTRASEÑA_ACA' con tu clave real de Supabase
+DB_URL = "postgresql://postgres:TU_CONTRASEÑA_ACA@db.oiijjpwfzgoprmjbsjrk.supabase.co:5432/postgres"
+engine = create_engine(DB_URL)
 
-if not os.path.exists(UPLOAD_PARENT_DIR):
-    os.makedirs(UPLOAD_PARENT_DIR)
-
-# --- SISTEMA DE BASE DE DATOS ---
-
-def get_db_connection():
-    conn = sqlite3.connect(DATABASE_NAME)
-    conn.row_factory = sqlite3.Row
-    return conn
-
+# --- INICIALIZAR TABLA EN LA NUBE ---
 def init_db():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('''
-        CREATE TABLE IF NOT EXISTS piezas (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            museo_id TEXT,
-            nombre TEXT UNIQUE,
-            cultura TEXT,
-            epoca TEXT,
-            material TEXT,
-            ubicacion TEXT,
-            resumen TEXT,
-            hash_visual TEXT, 
-            carpeta_fotos TEXT
-        )
-    ''')
-    conn.commit()
-    conn.close()
+    with engine.connect() as conn:
+        conn.execute(text('''
+            CREATE TABLE IF NOT EXISTS piezas (
+                id SERIAL PRIMARY KEY,
+                museo_id TEXT,
+                nombre TEXT UNIQUE,
+                cultura TEXT,
+                epoca TEXT,
+                material TEXT,
+                ubicacion TEXT,
+                resumen TEXT,
+                hash_visual TEXT,
+                fecha_registro TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+            )
+        '''))
+        conn.commit()
 
-# Inicializar DB al arrancar
 init_db()
 
-# --- MEJORA EN EL CÁLCULO DEL HASH (MÁS TOLERANTE) ---
+# --- FUNCIONES DE IA Y PROCESAMIENTO ---
+
 def preparar_y_hash(imagen_bytes):
     try:
-        # Convertir a escala de grises y redimensionar para que luz/color no afecten tanto
         img = Image.open(io.BytesIO(imagen_bytes)).convert('L')
         img = img.resize((256, 256), Image.Resampling.LANCZOS)
-        return imagehash.phash(img)
-    except Exception as e:
-        print(f"Error procesando imagen: {e}")
+        return str(imagehash.phash(img))
+    except:
         return None
 
-# --- RUTA PARA MANTENER EL SERVER DESPIERTO (OBLIGATORIA) ---
+def traducir_texto(texto):
+    if not texto or len(texto) < 3: return "En estudio"
+    try:
+        url = f"https://api.mymemory.translated.net/get?q={texto[:500]}&langpair=en|es"
+        res = requests.get(url, timeout=5).json()
+        return res.get('responseData', {}).get('translatedText', texto)
+    except: return texto
 
+# --- RUTA DE SALUD ---
 @app.route('/')
 def home():
-    # No tocar esta ruta para que UptimeRobot funcione
-    return "Servidor Activo 24/7 🚀", 200
+    return "Servidor con Base de Datos Permanente Activo 🚀", 200
 
 # --- ENDPOINTS PANEL WEB ---
 
@@ -76,53 +72,64 @@ def subir_pieza_museo():
         meta = json.loads(request.form.get('metadata'))
         fotos = request.files.getlist('fotos')
         
-        carpeta_pieza = os.path.join(UPLOAD_PARENT_DIR, meta['nombre'].replace(" ", "_"))
-        os.makedirs(carpeta_pieza, exist_ok=True)
+        # Generar hash de la primera foto (la principal de referencia)
+        hash_ref = preparar_y_hash(fotos[0].read())
         
-        # Generar hash de referencia usando la primera foto (frontal)
-        primer_foto_data = fotos[0].read()
-        hash_ref = str(preparar_y_hash(primer_foto_data))
-        
-        # Guardar físicamente las 5 fotos
-        fotos[0].seek(0)
-        for i, foto in enumerate(fotos):
-            foto.save(os.path.join(carpeta_pieza, f"angulo_{i+1}.jpg"))
-            
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('''
-            INSERT OR REPLACE INTO piezas 
-            (museo_id, nombre, cultura, epoca, material, ubicacion, resumen, hash_visual, carpeta_fotos)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        ''', (meta['museo'], meta['nombre'], meta['cultura'], meta['epoca'], 
-              meta['material'], meta['ubicacion'], meta['resumen'], hash_ref, carpeta_pieza))
-        conn.commit()
-        conn.close()
-        
-        print(f"✅ REGISTRADO: {meta['nombre']} | Hash: {hash_ref}")
+        with engine.connect() as conn:
+            query = text('''
+                INSERT INTO piezas (museo_id, nombre, cultura, epoca, material, ubicacion, resumen, hash_visual)
+                VALUES (:m, :n, :c, :e, :mat, :u, :r, :h)
+                ON CONFLICT (nombre) DO UPDATE SET
+                cultura=EXCLUDED.cultura, epoca=EXCLUDED.epoca, material=EXCLUDED.material, 
+                ubicacion=EXCLUDED.ubicacion, resumen=EXCLUDED.resumen, hash_visual=EXCLUDED.hash_visual
+            ''')
+            conn.execute(query, {
+                "m": meta['museo'], "n": meta['nombre'], "c": meta['cultura'],
+                "e": meta['epoca'], "mat": meta['material'], "u": meta['ubicacion'],
+                "r": meta['resumen'], "h": hash_ref
+            })
+            conn.commit()
         return jsonify({"status": "success"}), 201
     except Exception as e:
         return jsonify({"error": str(e)}), 500
 
 @app.route("/web/lista", methods=["GET"])
 def listar_piezas():
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, nombre, museo_id FROM piezas ORDER BY id DESC")
-    piezas = [dict(row) for row in cursor.fetchall()]
-    conn.close()
-    return jsonify(piezas)
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(text("SELECT id, nombre, museo_id FROM piezas ORDER BY id DESC"))
+            piezas = [dict(row) for row in result.mappings().all()]
+        return jsonify(piezas)
+    except:
+        return jsonify([])
 
 @app.route("/web/obtener/<int:id>", methods=["GET"])
 def obtener_pieza(id):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute("SELECT * FROM piezas WHERE id = ?", (id,))
-    pieza = cursor.fetchone()
-    conn.close()
+    with engine.connect() as conn:
+        result = conn.execute(text("SELECT * FROM piezas WHERE id = :id"), {"id": id})
+        pieza = result.mappings().first()
     return jsonify(dict(pieza)) if pieza else ({}, 404)
 
-# --- ENDPOINT CLASIFICAR (GODOT) ---
+@app.route("/web/editar/<int:id>", methods=["POST"])
+def editar_pieza(id):
+    try:
+        meta = json.loads(request.form.get('metadata'))
+        with engine.connect() as conn:
+            conn.execute(text('''
+                UPDATE piezas SET 
+                museo_id=:m, nombre=:n, cultura=:c, epoca=:e, material=:mat, ubicacion=:u, resumen=:r
+                WHERE id=:id
+            '''), {
+                "m": meta['museo'], "n": meta['nombre'], "c": meta['cultura'],
+                "e": meta['epoca'], "mat": meta['material'], "u": meta['ubicacion'],
+                "r": meta['resumen'], "id": id
+            })
+            conn.commit()
+        return jsonify({"status": "success"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+# --- ENDPOINT CLASIFICAR (PARA LA APP DE GODOT) ---
 
 @app.route("/clasificar", methods=["POST"])
 def clasificar():
@@ -131,41 +138,29 @@ def clasificar():
         return jsonify({"error": "No hay imagen"}), 400
 
     try:
-        # Decodificar imagen de la App
+        # Decodificar imagen de Godot
         img_b64 = data["imagen"].split(",")[1] if "," in data["imagen"] else data["imagen"]
         img_bytes = base64.b64decode(img_b64)
-        hash_app = preparar_y_hash(img_bytes)
+        hash_app = imagehash.phash(Image.open(io.BytesIO(img_bytes)).convert('L'))
         
-        if hash_app is None:
-            return jsonify({"error": "Error al procesar imagen de la App"}), 400
-
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute("SELECT * FROM piezas")
-        piezas_db = cursor.fetchall()
-        conn.close()
-
-        if not piezas_db:
-            print("⚠️ DB VACÍA")
-            return jsonify({"error": "No hay datos cargados"}), 404
+        # Traer todas las huellas digitales de la base de datos
+        with engine.connect() as conn:
+            result = conn.execute(text("SELECT * FROM piezas"))
+            piezas_db = result.mappings().all()
 
         mejor_match = None
-        menor_distancia = 64
-        umbral_sensibilidad = 28 # Más alto = más fácil reconocer (máximo 64)
+        menor_distancia = 26 # Umbral de tolerancia visual
 
         for pieza in piezas_db:
             if pieza['hash_visual']:
                 hash_db = imagehash.hex_to_hash(pieza['hash_visual'])
                 distancia = hash_app - hash_db
                 
-                print(f"Comparando con {pieza['nombre']} | Distancia: {distancia}")
-                
                 if distancia < menor_distancia:
                     menor_distancia = distancia
                     mejor_match = pieza
 
-        if mejor_match and menor_distancia <= umbral_sensibilidad:
-            print(f"🎯 MATCH: {mejor_match['nombre']} (D: {menor_distancia})")
+        if mejor_match:
             return jsonify({
                 "nombre": mejor_match['nombre'],
                 "cultura": mejor_match['cultura'],
@@ -175,11 +170,9 @@ def clasificar():
                 "resumen": mejor_match['resumen']
             })
 
-        print(f"❌ FALLO: Distancia mínima fue {menor_distancia}")
-        return jsonify({"error": "No reconocida"}), 404
+        return jsonify({"error": "Pieza no registrada"}), 404
 
     except Exception as e:
-        print(f"⚠️ ERROR: {str(e)}")
         return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":

@@ -17,7 +17,7 @@ CORS(app)
 
 # --- CONFIGURACIÓN DE BASE DE DATOS (SUPABASE) ---
 # Reemplaza 'TU_CONTRASEÑA_ACA' con tu clave real de Supabase
-DB_URL = "postgresql://postgres:TU_CONTRASEÑA_ACA@db.oiijjpwfzgoprmjbsjrk.supabase.co:5432/postgres"
+DB_URL = "postgresql://postgres:facugodot2026@db.oiijjpwfzgoprmjbsjrk.supabase.co:5432/postgres"
 engine = create_engine(DB_URL)
 
 # --- INICIALIZAR TABLA EN LA NUBE ---

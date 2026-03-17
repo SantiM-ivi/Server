@@ -1,6 +1,5 @@
 from flask import Flask, request, jsonify
 from flask_cors import CORS
-import requests
 import base64
 import os
 import json
@@ -68,8 +67,6 @@ def subir_pieza_museo():
     try:
         meta = json.loads(request.form.get('metadata'))
         fotos = request.files.getlist('fotos')
-        
-        # Hash de la primera foto para la base de datos
         hash_ref = preparar_y_hash(fotos[0].read())
         
         with engine.connect() as conn:
@@ -110,12 +107,22 @@ def obtener_pieza(id):
     except:
         return jsonify({}), 500
 
+# --- NUEVA RUTA: BORRAR PIEZA ---
+@app.route("/web/borrar/<int:id>", methods=["DELETE"])
+def borrar_pieza(id):
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("DELETE FROM piezas WHERE id = :id"), {"id": id})
+            conn.commit()
+        return jsonify({"status": "deleted"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
 @app.route("/clasificar", methods=["POST"])
 def clasificar():
     data = request.get_json()
     if not data or "imagen" not in data:
         return jsonify({"error": "No hay imagen"}), 400
-
     try:
         img_b64 = data["imagen"].split(",")[1] if "," in data["imagen"] else data["imagen"]
         img_bytes = base64.b64decode(img_b64)
@@ -127,7 +134,6 @@ def clasificar():
 
         mejor_match = None
         menor_distancia = 26 
-
         for pieza in piezas_db:
             if pieza['hash_visual']:
                 hash_db = imagehash.hex_to_hash(pieza['hash_visual'])
@@ -145,7 +151,6 @@ def clasificar():
                 "ubicacion": mejor_match['ubicacion'],
                 "resumen": mejor_match['resumen']
             })
-
         return jsonify({"error": "Pieza no reconocida"}), 404
     except Exception as e:
         return jsonify({"error": str(e)}), 500
@@ -153,5 +158,4 @@ def clasificar():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
-
 

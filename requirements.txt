@@ -1,9 +1,9 @@
 Flask
 Flask-Cors
+requests
 numpy
 Pillow
 gunicorn
 psycopg2-binary
 SQLAlchemy
-scikit-image
-scipy
+onnxruntime

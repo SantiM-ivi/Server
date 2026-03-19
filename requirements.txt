@@ -1,14 +1,9 @@
 Flask
 Flask-Cors
-requests
-beautifulsoup4
-pandas
 numpy
 Pillow
 gunicorn
-ImageHash
 psycopg2-binary
 SQLAlchemy
 scikit-image
 scipy
-numpy

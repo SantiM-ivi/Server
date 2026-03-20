@@ -105,23 +105,57 @@ def borrar_pieza(id):
 @app.route('/clasificar', methods=['POST'])
 def clasificar():
     try:
-        data = request.get_json()
-        img_bytes = base64.b64decode(data["imagen"].split(",")[1] if "," in data["imagen"] else data["imagen"])
+        # 1. Validar que llegue un JSON
+        data = request.get_json(silent=True)
+        if not data or "imagen" not in data:
+            return jsonify({"error": "JSON invalido o falta el campo 'imagen'"}), 400
+
+        # 2. Limpiar el Base64 (por si Godot envía el prefijo data:image/jpg;base64,)
+        img_data = data["imagen"]
+        if "," in img_data:
+            img_data = img_data.split(",")[1]
+        
+        try:
+            img_bytes = base64.b64decode(img_data)
+        except Exception as e:
+            return jsonify({"error": "No se pudo decodificar Base64"}), 400
+
+        # 3. Obtener el Embedding (ADN Visual)
         vec = get_embedding(img_bytes)
-        if not vec: return jsonify({"error": "IA Error"}), 400
+        if not vec:
+            return jsonify({"error": "La IA no pudo procesar la imagen"}), 400
+
+        # 4. Buscar en la Base de Datos
         with engine.connect() as conn:
             query = text("""
                 SELECT nombre, cultura, epoca, material, ubicacion, resumen, fotos_urls[1] as foto,
                 1 - (embedding <=> :v::vector) as sim
-                FROM piezas WHERE embedding IS NOT NULL ORDER BY embedding <=> :v::vector LIMIT 1
+                FROM piezas 
+                WHERE embedding IS NOT NULL 
+                ORDER BY embedding <=> :v::vector 
+                LIMIT 1
             """)
             res = conn.execute(query, {"v": str(vec)}).mappings().first()
+
+        # 5. Respuesta
         if res and res['sim'] >= SIMILARITY_THRESHOLD:
-            return jsonify({"match": True, "nombre": res['nombre'], "cultura": res['cultura'], "epoca": res['epoca'],
-                            "material": res['material'], "ubicacion": res['ubicacion'], "resumen": res['resumen'],
-                            "foto_url": res['foto'], "confianza": round(float(res['sim']) * 100, 2)}), 200
-        return jsonify({"match": False}), 404
-    except Exception as e: return jsonify({"error": str(e)}), 500
+            return jsonify({
+                "match": True,
+                "nombre": res['nombre'],
+                "cultura": res['cultura'],
+                "epoca": res['epoca'],
+                "material": res['material'],
+                "ubicacion": res['ubicacion'],
+                "resumen": res['resumen'],
+                "foto_url": res['foto'],
+                "confianza": round(float(res['sim']) * 100, 2)
+            }), 200
+        
+        return jsonify({"match": False, "confianza": round(float(res['sim']) * 100, 2) if res else 0}), 404
+
+    except Exception as e:
+        print(f"Error critico: {e}")
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))

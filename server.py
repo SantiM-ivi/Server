@@ -5,6 +5,7 @@ from PIL import Image
 import onnxruntime as ort
 from sqlalchemy import create_engine, text
 import requests as http_requests
+import traceback
 
 app = Flask(__name__)
 CORS(app)
@@ -24,17 +25,18 @@ engine = create_engine(DB_URL, pool_pre_ping=True)
 # Carga de ONNX
 session = None
 try:
-    if MODEL_PATH:
+    if os.path.exists(MODEL_PATH):
         session = ort.InferenceSession(MODEL_PATH, providers=['CPUExecutionProvider'])
         model_status = f"✅ ONNX Cargado: {MODEL_PATH}"
     else:
-        model_status = "❌ ARCHIVO .ONNX NO ENCONTRADO"
+        model_status = f"❌ ARCHIVO .ONNX NO ENCONTRADO EN: {os.getcwd()}"
 except Exception as e:
-    model_status = f"❌ ERROR ONNX: {str(e)}"
+    model_status = f"❌ ERROR AL CARGAR ONNX: {str(e)}"
 
 # --- FUNCIONES DE APOYO ---
 def get_embedding(img_bytes):
-    if not session: return None
+    if not session:
+        raise Exception("El modelo ONNX no está cargado en el servidor.")
     try:
         img = Image.open(io.BytesIO(img_bytes)).convert('RGB').resize((224, 224))
         arr = np.array(img, dtype=np.float32) / 255.0
@@ -47,7 +49,8 @@ def get_embedding(img_bytes):
         
         norm = np.linalg.norm(embedding)
         return (embedding / norm).tolist() if norm > 0 else None
-    except: return None
+    except Exception as e:
+        raise Exception(f"Error procesando la imagen en la IA: {str(e)}")
 
 def subir_foto_storage(imagen_bytes, pieza_nombre, indice):
     if not SUPABASE_URL or not SUPABASE_API_KEY: return None
@@ -73,14 +76,21 @@ def subir_pieza_museo():
         if not fotos: return jsonify({"error": "Falta imagen"}), 400
         
         fb = fotos[0].read()
-        emb = get_embedding(fb) # Generamos el vector de IA
+        emb = get_embedding(fb) 
         url = subir_foto_storage(fb, meta['nombre'], 0)
         
         with engine.connect() as conn:
             conn.execute(text('''
                 INSERT INTO piezas (museo_id, nombre, cultura, epoca, material, ubicacion, resumen, embedding, fotos_urls)
                 VALUES (:m, :n, :c, :e, :mat, :u, :r, :emb, :urls)
-                ON CONFLICT (nombre) DO UPDATE SET embedding=EXCLUDED.embedding, fotos_urls=EXCLUDED.fotos_urls
+                ON CONFLICT (nombre) DO UPDATE SET 
+                    embedding=EXCLUDED.embedding, 
+                    fotos_urls=EXCLUDED.fotos_urls,
+                    cultura=EXCLUDED.cultura,
+                    epoca=EXCLUDED.epoca,
+                    material=EXCLUDED.material,
+                    ubicacion=EXCLUDED.ubicacion,
+                    resumen=EXCLUDED.resumen
             '''), {
                 "m": meta['museo'], "n": meta['nombre'], "c": meta['cultura'], "e": meta['epoca'], 
                 "mat": meta['material'], "u": meta['ubicacion'], "r": meta['resumen'], 
@@ -88,16 +98,25 @@ def subir_pieza_museo():
             })
             conn.commit()
         return jsonify({"status": "success"}), 201
-    except Exception as e: return jsonify({"error": str(e)}), 500
+    except Exception as e:
+        print(traceback.format_exc())
+        return jsonify({"error": f"Error en subida: {str(e)}"}), 500
 
 @app.route('/clasificar', methods=['POST'])
 def clasificar():
     try:
         data = request.get_json()
-        img_bytes = base64.b64decode(data["imagen"].split(",")[1] if "," in data["imagen"] else data["imagen"])
+        if not data or "imagen" not in data:
+            return jsonify({"error": "No se recibió el campo 'imagen'"}), 400
+
+        img_b64 = data["imagen"].split(",")[1] if "," in data["imagen"] else data["imagen"]
+        img_bytes = base64.b64decode(img_b64)
         vec = get_embedding(img_bytes)
         
         with engine.connect() as conn:
+            # Agregamos log de dimensión para debuggear en consola
+            print(f"DEBUG: Vector generado de tamaño {len(vec)}")
+            
             query = text("""
                 SELECT nombre, cultura, epoca, material, ubicacion, resumen, fotos_urls[1] as foto,
                 1 - (embedding <=> :v::vector) as sim
@@ -106,24 +125,37 @@ def clasificar():
             res = conn.execute(query, {"v": str(vec)}).mappings().first()
             
         if res and res['sim'] >= SIMILARITY_THRESHOLD:
-            return jsonify({"match": True, "nombre": res['nombre'], "cultura": res['cultura'], "epoca": res['epoca'],
-                            "material": res['material'], "ubicacion": res['ubicacion'], "resumen": res['resumen'],
-                            "foto_url": res['foto'], "confianza": round(float(res['sim']) * 100, 2)}), 200
-        return jsonify({"match": False}), 404
-    except Exception as e: return jsonify({"error": str(e)}), 500
+            return jsonify({
+                "match": True, "nombre": res['nombre'], "cultura": res['cultura'], "epoca": res['epoca'],
+                "material": res['material'], "ubicacion": res['ubicacion'], "resumen": res['resumen'],
+                "foto_url": res['foto'], "confianza": round(float(res['sim']) * 100, 2)
+            }), 200
+        
+        sim_final = round(float(res['sim']) * 100, 2) if res else 0
+        return jsonify({"match": False, "confianza": sim_final}), 404
+    except Exception as e:
+        print(traceback.format_exc())
+        return jsonify({"error": f"Error en clasificación: {str(e)}"}), 500
 
 @app.route("/web/lista", methods=["GET"])
 def listar_piezas():
-    with engine.connect() as conn:
-        result = conn.execute(text("SELECT id, nombre, museo_id FROM piezas ORDER BY id DESC"))
-        return jsonify([dict(r) for r in result.mappings().all()])
+    try:
+        with engine.connect() as conn:
+            result = conn.execute(text("SELECT id, nombre, museo_id FROM piezas ORDER BY id DESC"))
+            return jsonify([dict(r) for r in result.mappings().all()])
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 @app.route("/web/borrar/<int:id>", methods=["DELETE"])
 def borrar_pieza(id):
-    with engine.connect() as conn:
-        conn.execute(text("DELETE FROM piezas WHERE id=:id"), {"id": id})
-        conn.commit()
-    return jsonify({"status": "deleted"}), 200
+    try:
+        with engine.connect() as conn:
+            conn.execute(text("DELETE FROM piezas WHERE id=:id"), {"id": id})
+            conn.commit()
+        return jsonify({"status": "deleted"}), 200
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
+    port = int(os.environ.get("PORT", 5000))
+    app.run(host="0.0.0.0", port=port)

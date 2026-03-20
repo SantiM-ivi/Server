@@ -6,4 +6,5 @@ Pillow
 gunicorn
 psycopg2-binary
 SQLAlchemy
-onnxruntime
+tensorflow-cpu
+pgvector

@@ -11,7 +11,7 @@ CORS(app)
 
 # --- CONFIGURACIÓN ---
 DB_URL = "postgresql://postgres.oiijjpwfzgoprmjbsjrk:facugodot2026@aws-1-us-east-1.pooler.supabase.com:6543/postgres"
-MODEL_PATH = "modelo_ia.onnx" # Asegurate de que este archivo esté en tu GitHub
+MODEL_PATH = "modelo_museo.onnx" # Asegurate de que este archivo esté en tu GitHub
 SIMILARITY_THRESHOLD = 0.78
 
 # Supabase Storage

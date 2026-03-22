@@ -10,19 +10,20 @@ from ultralytics import YOLO
 from sqlalchemy import create_engine, text
 import requests as http_requests
 import traceback
+import gc
 
 app = Flask(__name__)
 CORS(app)
 
 # --- CONFIGURACIÓN ---
 DB_URL = "postgresql://postgres.oiijjpwfzgoprmjbsjrk:facugodot2026@aws-1-us-east-1.pooler.supabase.com:6543/postgres"
-SIMILARITY_THRESHOLD = 0.5 # Ajustado para Normalización L2
+SIMILARITY_THRESHOLD = 0.5 
 
 engine = create_engine(DB_URL, pool_pre_ping=True)
 
 class ArtAI:
     def __init__(self):
-        print("📥 Cargando YOLO y MobileNet...")
+        print("📥 [IA] Cargando modelos...")
         self.detector = YOLO('yolov8n.pt')
         self.extractor = models.mobilenet_v3_small(weights=models.MobileNet_V3_Small_Weights.DEFAULT)
         self.extractor.classifier = nn.Identity()
@@ -59,43 +60,45 @@ class ArtAI:
 ai = ArtAI()
 
 @app.route('/')
-def home(): return "Cerebro Activo 🧠", 200
+def home(): return "🧠 Cerebro Activo y Corregido", 200
 
-# --- ESCÁNER (PARA GODOT) ---
 @app.route('/clasificar', methods=['POST'])
 def clasificar():
+    print("\n--- [NUEVA PETICIÓN DE GODOT] ---")
     try:
         data = request.get_json()
-        if not data or "imagen" not in data:
-            return jsonify({"error": "No se recibió imagen"}), 400
-            
-        img_data = data["imagen"]
-        if "," in img_data: img_data = img_data.split(",")[1]
+        img_str = data["imagen"]
+        if "," in img_str: img_str = img_str.split(",")[1]
         
-        img_bytes = base64.b64decode(img_data)
+        img_bytes = base64.b64decode(img_str)
         raw_img = Image.open(io.BytesIO(img_bytes)).convert('RGB')
         
-        # 1. IA: Crop y Embedding
+        # IA
+        print("1. Procesando imagen con IA...")
         clean_img = ai.smart_crop(raw_img)
         vec = ai.get_embedding(clean_img)
         
-        # 2. Supabase: Búsqueda Vectorial
-        # IMPORTANTE: Convertimos el vector a string para que pgvector lo entienda
-        vec_str = "[" + ",".join(map(str, vec)) + "]"
+        # Formato de vector para Postgres
+        vec_pg = "[" + ",".join(map(str, vec)) + "]"
+        print(f"2. Vector generado (dim {len(vec)}). Buscando en DB...")
         
+        # --- FIX DE SINTAXIS SQL ---
         with engine.connect() as conn:
+            # Usamos CAST(:v AS vector) para evitar el error de los dos puntos ::
             query = text("""
                 SELECT nombre, cultura, epoca, material, ubicacion, resumen, 
-                       (embedding <=> :v::vector) as distance
+                       (embedding <=> CAST(:v AS vector)) as distance
                 FROM piezas 
                 WHERE embedding IS NOT NULL 
-                ORDER BY embedding <=> :v::vector 
+                ORDER BY embedding <=> CAST(:v AS vector) 
                 LIMIT 1
             """)
-            res = conn.execute(query, {"v": vec_str}).mappings().first()
+            res = conn.execute(query, {"v": vec_pg}).mappings().first()
             
         if res:
             dist = float(res['distance'])
+            print(f"3. Resultado DB: {res['nombre']} | Distancia: {dist:.4f}")
+            
             if dist <= SIMILARITY_THRESHOLD:
                 return jsonify({
                     "match": True,
@@ -108,35 +111,34 @@ def clasificar():
                     "confianza": round((1 - dist) * 100, 2)
                 }), 200
         
-        return jsonify({"match": False, "distancia": float(res['distance']) if res else 2.0}), 404
+        print("4. No se encontró ninguna obra lo suficientemente parecida.")
+        return jsonify({"match": False, "dist": float(res['distance']) if res else 2.0}), 404
 
     except Exception as e:
-        # Esto te va a decir el error exacto en el log de Render
-        print("❌ ERROR CRÍTICO:")
+        print("❌ ERROR EN EL PROCESO:")
         print(traceback.format_exc())
-        return jsonify({"error": str(e), "trace": "Ver logs del servidor"}), 500
+        return jsonify({"error": str(e)}), 500
 
-# --- SUBIDA (PARA WEB) ---
+# RUTA PARA WEB (También corregida)
 @app.route('/web/subir_completo', methods=['POST'])
 def subir():
     try:
         meta = json.loads(request.form.get('metadata'))
         fotos = request.files.getlist('fotos')
-        
-        # Embedding de la foto principal
         img_pil = Image.open(fotos[0]).convert('RGB')
         emb = ai.get_embedding(img_pil)
-        vec_str = "[" + ",".join(map(str, emb)) + "]"
+        vec_pg = "[" + ",".join(map(str, emb)) + "]"
 
         with engine.connect() as conn:
+            # También corregido aquí el CAST
             conn.execute(text("""
                 INSERT INTO piezas (museo_id, nombre, cultura, epoca, material, ubicacion, resumen, embedding)
-                VALUES (:m, :n, :c, :e, :mat, :u, :r, :emb::vector)
+                VALUES (:m, :n, :c, :e, :mat, :u, :r, CAST(:emb AS vector))
                 ON CONFLICT (nombre) DO UPDATE SET embedding = EXCLUDED.embedding
             """), {
                 "m": meta['museo'], "n": meta['nombre'], "c": meta['cultura'], 
                 "e": meta['epoca'], "mat": meta['material'], "u": meta['ubicacion'], 
-                "r": meta['resumen'], "emb": vec_str
+                "r": meta['resumen'], "emb": vec_pg
             })
             conn.commit()
         return jsonify({"status": "success"}), 201
@@ -145,7 +147,7 @@ def subir():
         return jsonify({"error": str(e)}), 500
 
 @app.route("/web/lista")
-def lista():
+def listar():
     with engine.connect() as conn:
         res = conn.execute(text("SELECT id, nombre, museo_id FROM piezas")).mappings().all()
         return jsonify([dict(r) for r in res])
@@ -158,4 +160,4 @@ def borrar(id):
     return jsonify({"status": "deleted"})
 
 if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 10000)))
+    app.run(host="0.0.0.0", port=10000)

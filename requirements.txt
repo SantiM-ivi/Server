@@ -6,5 +6,6 @@ Pillow
 gunicorn
 psycopg2-binary
 SQLAlchemy
-onnxruntime
-pgvector
+torch
+torchvision
+ultralytics
